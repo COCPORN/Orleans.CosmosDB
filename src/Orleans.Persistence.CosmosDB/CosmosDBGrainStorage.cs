@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Orleans.ApplicationParts;
 using Orleans.Configuration;
 using Orleans.Persistence.CosmosDB.Models;
 using Orleans.Runtime;
@@ -46,12 +47,17 @@ namespace Orleans.Persistence.CosmosDB
         private readonly CosmosDBStorageOptions _options;
         internal DocumentClient _dbClient;  // internal for test
         private IGrainReferenceConverter _grainReferenceConverter;
+        private IApplicationPartManager _applicationPartsManager;
 
         private const HttpStatusCode TooManyRequests = (HttpStatusCode)429;
 
         public CosmosDBGrainStorage(string name, CosmosDBStorageOptions options, SerializationManager serializationManager,
             Providers.IProviderRuntime providerRuntime,
-            IOptions<ClusterOptions> clusterOptions, IGrainFactory grainFactory, ITypeResolver typeResolver, ILoggerFactory loggerFactory)
+            IOptions<ClusterOptions> clusterOptions,
+            IGrainFactory grainFactory,
+            ITypeResolver typeResolver,
+            IApplicationPartManager applicationPartsManager,
+            ILoggerFactory loggerFactory)
         {
             this._name = name;
 
@@ -64,6 +70,7 @@ namespace Orleans.Persistence.CosmosDB
             this._typeResolver = typeResolver;
             this._serviceId = clusterOptions.Value.ServiceId;
             this._grainReferenceConverter = (IGrainReferenceConverter)providerRuntime.ServiceProvider.GetService(typeof(IGrainReferenceConverter));
+            this._applicationPartsManager = applicationPartsManager;
 
             this._sprocFiles = new Dictionary<string, string>
             {
@@ -82,6 +89,39 @@ namespace Orleans.Persistence.CosmosDB
                 this._options.JsonSerializerSettings.DefaultValueHandling = DefaultValueHandling.Include;
                 this._options.JsonSerializerSettings.PreserveReferencesHandling = PreserveReferencesHandling.None;
             }
+            
+            this.ScanAssemblies(applicationPartsManager);
+        }
+
+        private void ScanAssemblies(IApplicationPartManager applicationPartsManager)
+        {
+            foreach (var applicationPart in applicationPartsManager.ApplicationParts)
+            {
+                if (applicationPart is AssemblyPart assemblyPart)
+                {
+                    var assembly = assemblyPart.Assembly;
+                    foreach (var type in assembly.GetTypes())
+                    {
+                        foreach (var property in type.GetProperties())
+                        {
+                            foreach (var attribute in property.GetCustomAttributes<IndexAttribute>())
+                            {
+                                this._options.StateFieldsToIndex.Add(PathName(property.Name, attribute));
+                            }
+                        }
+                    }
+                }
+            }            
+        }
+
+        public static string PathName(string propertyName, IndexAttribute attribute)
+        {
+            string stringToIndex = string.Empty;
+            if (string.IsNullOrEmpty(attribute.Path) && string.IsNullOrEmpty(attribute.Prefix)) return propertyName;
+            if (string.IsNullOrEmpty(attribute.Path) == false && string.IsNullOrEmpty(attribute.Prefix)) return attribute.Path;
+            if (string.IsNullOrEmpty(attribute.Prefix) == false) stringToIndex = attribute.Prefix + "/";
+            if (string.IsNullOrEmpty(attribute.Path) == false) return stringToIndex + attribute.Path;
+            return stringToIndex + propertyName;
         }
 
         public void Participate(ISiloLifecycle lifecycle)
@@ -155,7 +195,9 @@ namespace Orleans.Persistence.CosmosDB
 
                 if (spResponse.Response?.State != null)
                 {
-                    grainState.State = JsonConvert.DeserializeObject(spResponse.Response.State.ToString(), grainState.State.GetType(), _options.JsonSerializerSettings);
+                    grainState.State = JsonConvert.DeserializeObject(spResponse.Response.State.ToString(),
+                        grainState.State.GetType(),
+                        this._options.JsonSerializerSettings);
                     grainState.ETag = spResponse.Response.ETag;
                 }
                 else
@@ -354,9 +396,10 @@ namespace Orleans.Persistence.CosmosDB
             }
 
             const int maxRetries = 3;
+            ResourceResponse<DocumentCollection> collResponse = null;
             for (var retry = 0; retry <= maxRetries; ++retry)
             {
-                var collResponse = await this._dbClient.CreateDocumentCollectionIfNotExistsAsync(
+                collResponse = await this._dbClient.CreateDocumentCollectionIfNotExistsAsync(
                     UriFactory.CreateDatabaseUri(this._options.DB),
                     stateCollection,
                     new RequestOptions
@@ -364,12 +407,19 @@ namespace Orleans.Persistence.CosmosDB
                         PartitionKey = new PartitionKey(PARTITION_KEY),
                         ConsistencyLevel = this._options.GetConsistencyLevel(),
                         OfferThroughput = this._options.CollectionThroughput
-                    });
+                    });                
                 if (retry == maxRetries || dbResponse.StatusCode != HttpStatusCode.Created || collResponse.StatusCode == HttpStatusCode.Created)
                 {
                     break;  // Apparently some throttling logic returns HttpStatusCode.OK (not 429) when the collection wasn't created in a new DB.
                 }
+             
                 await Task.Delay(1000);
+            }
+
+            if (collResponse != null && HttpStatusCode.OK == collResponse.StatusCode)
+            {
+                var updateCollectionResponse = await this._dbClient.ReplaceDocumentCollectionAsync(UriFactory.CreateDatabaseUri(this._options.DB),
+                    stateCollection);
             }
         }
 
